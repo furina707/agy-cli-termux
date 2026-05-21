@@ -195,19 +195,25 @@ cat << 'EOF' > "$INSTALL_DIR/agy_patcher.c"
 #include <stdlib.h>
 #include <string.h>
 
-void patch_fips(unsigned char *data, size_t size) {
+void patch_fips(unsigned char *data, size_t size, const char *hex_hash) {
     unsigned char expected[32] = {
         0x90, 0x94, 0x62, 0x7e, 0x2b, 0xd0, 0x3d, 0x96, 
         0x2b, 0xa1, 0xd0, 0xc4, 0x42, 0x0a, 0x1d, 0xa9, 
         0xe1, 0xae, 0x55, 0xca, 0xef, 0x8e, 0xde, 0x7b, 
         0x68, 0x02, 0x8d, 0x7a, 0x4a, 0x71, 0xf1, 0x61
     };
-    unsigned char calculated[32] = {
-        0xca, 0xe6, 0x01, 0xae, 0xec, 0x02, 0x16, 0xca, 
-        0xd2, 0x04, 0x27, 0x98, 0xd4, 0x77, 0x76, 0xec, 
-        0x63, 0x3f, 0x59, 0x0f, 0x53, 0x71, 0xfa, 0xaf, 
-        0x2f, 0x04, 0x6b, 0x94, 0x14, 0x69, 0xe9, 0x98
-    };
+    unsigned char calculated[32];
+
+    if (strlen(hex_hash) != 64) {
+        fprintf(stderr, "[PATCHER ERROR] FIPS hex hash must be exactly 64 characters\n");
+        return;
+    }
+
+    for (size_t i = 0; i < 32; i++) {
+        unsigned int val;
+        sscanf(&hex_hash[i * 2], "%2x", &val);
+        calculated[i] = (unsigned char)val;
+    }
 
     size_t count = 0;
     for (size_t i = 0; i <= size - 32; i++) {
@@ -332,7 +338,7 @@ void patch_tcmalloc(unsigned char *data, size_t size) {
 
 int main(int argc, char *argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <input_file> <output_file>\n", argv[0]);
+        fprintf(stderr, "Usage:\n  Only TCMalloc: %s <input_file> <output_file>\n  TCMalloc & FIPS: %s <input_file> <output_file> <fips_hex_hash>\n", argv[0], argv[0]);
         return 1;
     }
 
@@ -361,8 +367,13 @@ int main(int argc, char *argv[]) {
     }
     fclose(f);
 
+    // Apply TCMalloc shifts patch (Phase 1)
     patch_tcmalloc(data, size);
-    patch_fips(data, size);
+
+    // Apply BoringSSL FIPS expected hash patch if provided (Phase 2)
+    if (argc >= 4) {
+        patch_fips(data, size, argv[3]);
+    }
 
     FILE *out = fopen(argv[2], "wb");
     if (!out) {
@@ -393,19 +404,16 @@ else
     exit 1
 fi
 
-info "Applying 35-bit TCMalloc and FIPS expected hash patches natively..."
+info "Applying Phase 1: 35-bit TCMalloc shifts patch natively..."
 if "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/antigravity" "$INSTALL_DIR/antigravity_patched"; then
     success "Binary patched successfully."
-    # Overwrite original binary with the fully patched executable
+    # Overwrite original binary with the TCMalloc-patched executable
     mv -f "$INSTALL_DIR/antigravity_patched" "$INSTALL_DIR/antigravity"
     chmod +x "$INSTALL_DIR/antigravity"
 else
-    error "Failed to patch binary on-device."
+    error "Failed to patch binary on-device during Phase 1."
     exit 1
 fi
-
-# Clean up patcher
-rm -f "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/agy_patcher.c"
 
 # 8.5. Compile faccessat2 ptrace syscall interception tracer
 info "Engineering self-contained faccessat2 ptrace syscall interception tracer..."
@@ -639,6 +647,42 @@ if [ -n "$LD_SO" ]; then
 else
     GLIBC_LIB_DIR="$GLIBC_PREFIX/lib"
 fi
+
+# 9.5. Phase 2: Dynamic BoringSSL FIPS expected hash capturing and patching
+info "Entering Phase 2: Resolving BoringSSL FIPS calculated hash dynamically..."
+(
+    unset LD_PRELOAD
+    set +e
+    if [ -n "$LD_SO" ]; then
+        hash_output=$("$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" --version 2>&1 || true)
+    else
+        hash_output=$("$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" --version 2>&1 || true)
+    fi
+    set -e
+
+    calculated_hash=$(echo "$hash_output" | grep "Calculated:" | tail -n 1 | awk '{print $2}' | tr -d '\r\n ' || true)
+    
+    if [[ "$calculated_hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        success "Dynamically captured FIPS calculated hash: $calculated_hash"
+        info "Applying Phase 2: Overwriting expected hash signature natively..."
+        if "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/antigravity" "$INSTALL_DIR/antigravity_patched" "$calculated_hash"; then
+            mv -f "$INSTALL_DIR/antigravity_patched" "$INSTALL_DIR/antigravity"
+            chmod +x "$INSTALL_DIR/antigravity"
+            success "BoringSSL FIPS integrity verification signature aligned successfully."
+        else
+            error "Failed to patch FIPS expected signature."
+            exit 1
+        fi
+    else
+        error "Fatal: Could not capture a valid FIPS calculated hash from the runtime error diagnostic payload."
+        echo -e "${YELLOW}Diagnostics output:${NC}"
+        echo "$hash_output"
+        exit 1
+    fi
+)
+
+# Clean up patcher
+rm -f "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/agy_patcher.c"
 
 # 10. Initialization Handoff
 info "Configuring Termux environment dependencies..."
