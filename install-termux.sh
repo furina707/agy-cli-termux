@@ -423,7 +423,7 @@ fi
 # Remove temporary source file to keep installation clean
 rm -f "$INSTALL_DIR/agy_ptrace_tracer.c"
 
-# 9. Create Launcher Wrapper
+# 9. Locate Glibc Paths
 info "Locating glibc dynamic linker and library path..."
 GLIBC_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}/glibc"
 LD_SO=""
@@ -443,6 +443,28 @@ else
     GLIBC_LIB_DIR="$GLIBC_PREFIX/lib"
 fi
 
+# 10. Initialization Handoff
+info "Configuring Termux environment dependencies..."
+# Execute native configuration with the syscall tracer active
+# Unset LD_PRELOAD during setup to prevent glibc dynamic linker from loading Bionic libtermux-exec.so
+(
+    unset LD_PRELOAD
+    if [ -n "$LD_SO" ]; then
+        if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+            success "Shell configurations initialized."
+        else
+            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+        fi
+    else
+        if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+            success "Shell configurations initialized."
+        else
+            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+        fi
+    fi
+)
+
+# 11. Create Launcher Wrapper
 info "Creating dynamic launch wrapper at $WRAPPER_PATH..."
 if [ -z "$LD_SO" ]; then
     warn "Could not dynamically locate glibc dynamic linker. Falling back to 'grun'..."
@@ -470,27 +492,6 @@ fi
 
 chmod +x "$WRAPPER_PATH"
 success "Wrapper created and executable bits set."
-
-# 10. Initialization Handoff
-info "Configuring Termux environment dependencies..."
-# Execute native configuration with the syscall tracer active
-# Unset LD_PRELOAD during setup to prevent glibc dynamic linker from loading Bionic libtermux-exec.so
-(
-    unset LD_PRELOAD
-    if [ -n "$LD_SO" ]; then
-        if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
-            success "Shell configurations initialized."
-        else
-            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
-        fi
-    else
-        if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
-            success "Shell configurations initialized."
-        else
-            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
-        fi
-    fi
-)
 
 echo ""
 echo -e "${GREEN}==================================================${NC}"
