@@ -496,7 +496,7 @@ int main(int argc, char *argv[]) {
             exit(1);
         }
         raise(SIGSTOP);
-        
+
         execvp(argv[1], &argv[1]);
         perror("execvp");
         exit(1);
@@ -508,8 +508,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | 
-                   PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | 
+    long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE |
+                   PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
                    PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT;
     if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)options) < 0) {
         perror("[TRACER ERROR] ptrace SETOPTIONS failed");
@@ -550,7 +550,26 @@ int main(int argc, char *argv[]) {
         if (WIFSTOPPED(status)) {
             int sig = WSTOPSIG(status);
             int event = status >> 16;
-            
+
+            // --- DEFENSE LINE 2: Catch and swallow Seccomp SIGSYS crash signals ---
+            if (sig == SIGSYS) {
+                struct custom_pt_regs regs;
+                struct iovec iov_regs;
+                iov_regs.iov_base = &regs;
+                iov_regs.iov_len = sizeof(regs);
+
+                if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs) == 0) {
+                    regs.regs[0] = -38ULL; // Force return -ENOSYS
+                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs);
+                }
+
+                // Resume child with signal suppressed (0 instead of SIGSYS)
+                if (ptrace(PTRACE_SYSCALL, pid, NULL, (void *)0) < 0) {
+                    perror("[TRACER ERROR] ptrace SYSCALL failed to suppress SIGSYS");
+                }
+                continue;
+            }
+
             if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
                 memset(threads, 0, sizeof(threads));
                 int idx = get_thread_index(pid, 1);
@@ -562,28 +581,28 @@ int main(int argc, char *argv[]) {
                 }
                 continue;
             }
-            
+
             if (sig == (SIGTRAP | 0x80)) {
                 int idx = get_thread_index(pid, 1);
                 if (idx != -1) {
                     threads[idx].in_syscall = !threads[idx].in_syscall;
-                    
+
                     if (threads[idx].in_syscall) {
-                        // Syscall ENTRY stop
+                        // --- DEFENSE LINE 1: Intercept ENTRY stop for faccessat2 ---
                         int syscall_num;
                         struct iovec iov;
                         iov.iov_base = &syscall_num;
                         iov.iov_len = sizeof(syscall_num);
-                        
+
                         if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov) == 0) {
-                            if (syscall_num == 279) { // __NR_faccessat2
+                            if (syscall_num == 439) { // __NR_faccessat2 on ARM64
                                 syscall_num = -1;
                                 if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov) == 0) {
                                     struct custom_pt_regs regs;
                                     struct iovec iov_regs;
                                     iov_regs.iov_base = &regs;
                                     iov_regs.iov_len = sizeof(regs);
-                                    
+
                                     if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs) == 0) {
                                         regs.regs[0] = -38ULL; // -ENOSYS
                                         regs.regs[8] = -1ULL;
@@ -595,11 +614,13 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) < 0) {
-                    perror("[TRACER ERROR] ptrace SYSCALL failed after sysgood stop");
+                    if (errno != ESRCH) {
+                        perror("[TRACER ERROR] ptrace SYSCALL failed after sysgood stop");
+                    }
                 }
                 continue;
             }
-            
+
             int deliver_sig = sig;
             if (sig == SIGSTOP) {
                 deliver_sig = 0;
@@ -608,7 +629,9 @@ int main(int argc, char *argv[]) {
             }
 
             if (ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)deliver_sig) < 0) {
-                perror("[TRACER ERROR] ptrace SYSCALL failed for signal");
+                if (errno != ESRCH) {
+                    perror("[TRACER ERROR] ptrace SYSCALL failed for signal");
+                }
             }
         }
     }
