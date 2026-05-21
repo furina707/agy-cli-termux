@@ -1,41 +1,77 @@
 # Antigravity CLI - Termux 适配器
 
-在 Android Termux 中，通过自定义的 `glibc-runner`（`grun`）桥接环境，原生且无缝地运行专为标准 Linux ARM64 (glibc) 编译的 **Antigravity CLI**。
+在 Android Termux 中，通过自定义的 `glibc-runner`（`grun`）桥接环境 + 二进制补丁 + ptrace 系统调用拦截，
+原生且无缝地运行专为标准 Linux ARM64 (glibc) 编译的 **Antigravity CLI**。
 
 ---
 
-## 💡 问题背景
+## 问题背景
 
-Antigravity CLI 官方发布的 Linux ARM64 二进制文件是针对标准 Linux 平台编译的，静态或动态链接了 **`glibc`**（GNU C 运行库）。
-然而，Android 系统（及 Termux 容器）底层采用的是 Google 专有的 **`Bionic libc`**，且不遵循传统的 Linux 文件系统层级标准（FHS）。
-因此，直接在 Termux 原生环境下运行该二进制文件会导致动态链接器缺失，抛出类似 `No such file or directory` 或 `exec format error` 的错误。
+Antigravity CLI 官方发布的 Linux ARM64 二进制文件是针对标准 Linux 平台编译的，静态链接了 **glibc**（GNU C 运行库）
+与 **TCMalloc** 内存分配器。然而：
 
----
-
-## ⚡ 解决方案 (方案 B)
-
-本项目通过自动配置 **`glibc-runner` (`grun`)** 建立一个轻量级的动态兼容桥梁，并集成了定制的内存垫片，彻底解决兼容性问题。
-
-### 🌟 TCMalloc 48-bit 虚拟地址空间崩溃修复
-官方编译的 Linux ARM64 二进制文件静态链接了 Google 的 **TCMalloc** 高性能内存分配器。该分配器硬编码假定操作系统拥有 **48-bit 虚拟地址空间**（桌面/服务器 Linux 标准），并在初始化时尝试 `mmap` 寻址超高的地址空间（例如错误日志中的 `hint=0x4e88c0000000`，即 ~78.5 TiB 处）。
-然而，几乎所有 Android 设备的 ARM64 内核均配置为 **39-bit 虚拟地址空间**（最大寻址空间为 512 GiB，即上限为 `0x8000000000`）。当静态 TCMalloc 触发建议地址位于 48-bit 的 `mmap` 系统调用时，Android 内核将直接拒绝该越界寻址，导致程序抛出 `MmapAligned() failed - unable to allocate with tag` 并 Fatal OOM 闪退。
-
-为了在**不修改内核、不改变 PRoot 隔离、不重构官方静态二进制程序**的前提下解决该底层硬件/内核级限制，本项目实现了以下高阶适配方案：
-1. **本地自包含即时编译**：适配脚本将自动在 Termux 本地通过 `clang` 即时编译一个垫片库 `libmmap_shim.so`。
-2. **纯自包含零依赖 (-nostdlib)**：垫片库采用纯自包含设计（不依赖任何 glibc 或 Bionic libc 动态库），使得它可以被 Bionic linker（如运行中的包装脚本或 `grun` 自身）与 Glibc Linker（如 `agy` 原生程序）同时安全加载，**不产生任何 dynamic linker 警告或运行时符号冲突**。
-3. **高位建议地址过滤**：使用底层的 ARM64 原生内联汇编系统调用指令（`svc #0`）代理 `mmap` 和 `mmap64`。当检测到 `addr` 建议参数超出 39-bit（`>= 0x8000000000`）时，垫片自动将其剥离重置为 `NULL`，强制内核分配安全的 39-bit 虚拟内存空间（完美兼容 48-bit  radix 树的低位寻址）。
-4. **环境包装拦截**：生成执行包装器 `$PREFIX/bin/agy`，通过预加载（`LD_PRELOAD`）把垫片无感知地注入到执行会话中，实现完美平滑启动。
-
-本安装适配脚本 (`install-termux.sh`) 将自动完成以下工作：
-1. 自动检测设备 CPU 架构，确保为 `aarch64` (ARM64) 架构。
-2. 检查并自动拉取 Termux 包管理器中的 `glibc-runner` 依赖。
-3. 从官方发布服务安全下载标准 `linux_arm64` 平台压缩包。
-4. 使用哈希签名比对进行 SHA512 完整性强校验，确保文件未被篡改。
-5. 解压主程序至隔离库目录，并在系统执行路径 `$PREFIX/bin/agy` 下生成微型链接包装器（Wrapper）。
+- Android 系统（及 Termux 容器）底层采用 **Bionic libc**，无法直接加载 glibc 动态链接器
+- Android ARM64 内核配置为 **39-bit 虚拟地址空间**（上限 `0x8000000000`），而 TCMalloc 硬编码假定 **48-bit 空间**
+  并尝试 `mmap` 超高地址（如 `hint=0x4e88c0000000`），导致 `MmapAligned() failed` 崩溃
+- Antigravity CLI 使用了 seccomp 沙箱，其中 `faccessat2`（syscall 439）在 Android 低版本内核中缺失，触发 `SIGSYS` 信号杀死进程
 
 ---
 
-## 🚀 安装与部署
+## 解决方案
+
+本项目通过四层适配解决全部兼容性问题：
+
+### 1. glibc-runner 桥接层
+自动安装 `glibc-runner`（`grun`），提供 glibc 动态链接器和库路径，使标准 Linux ARM64 二进制可以在 Termux 中加载执行。
+
+### 2. TCMalloc 35-bit 地址空间降维补丁
+在 Termux 本地通过 `clang` 编译一个二进制补丁工具，扫描 ELF 中 TCMalloc 的指令编码，将：
+
+- `ubfx Xd, Xn, #42, #3` → `#35, #3`
+- `lsr/lsl/asr Xd, Xn, #42` → `#35`
+- `movz/movk Xd, #0x1000/0x1800/0x1400, lsl #32` → `#0x20/0x30/0x28`
+- `and Xd, Xn, #0x1c0000000000` → `#0x3800000000`
+- `tst Xn, #0x1c0000000000` → `#0x3800000000`
+
+从而将所有 48-bit 地址常量降为 35-bit，适配 Android 39-bit 地址空间。
+
+### 3. BoringSSL FIPS 完整性签名补丁
+BoringSSL FIPS 模块在初始化时会校验自身的预期哈希值，与运行时计算的实际哈希比对。补丁工具从运行时错误信息中动态捕获实际哈希值，然后用它覆写二进制中的预期哈希，使 FIPS 自检通过。
+
+### 4. ptrace 系统调用拦截器
+本地编译一个 ptrace tracer 子进程，拦截被追踪进程的系统调用：
+
+- **防御层 1**：在 syscall 入口拦截 `faccessat2`（syscall 439），将其替换为 `-1` 并返回 `-ENOSYS`
+- **防御层 2**：捕获 seccomp 触发的 `SIGSYS` 信号，强制修改返回值为 `-ENOSYS` 后继续运行
+
+### 架构图
+
+```
+用户输入命令 [agy]
+       │
+       ▼
+执行路径启动器包装脚本 [$PREFIX/bin/agy]
+       │ (设置 SSL_CERT_FILE, CURL_CA_BUNDLE 等环境变量)
+       ▼
+ptrace 系统调用拦截器 [agy_ptrace_tracer]
+       │ (通过 ptrace 拦截 faccessat2 / SIGSYS)
+       ▼
+glibc-runner 解释器 [grun] 或 直接调用 glibc 动态链接器 [ld-linux-aarch64.so.1]
+       │ (加载 glibc 动态运行库环境)
+       ▼
+执行已修补的官方 Linux ARM64 原生 ELF 二进制文件
+       │ (TCMalloc 35-bit 降维 + FIPS 签名已修补)
+```
+
+### 安全性
+
+- 所有代码在 Termux 本地通过 `clang` 即时编译，不下载预编译二进制
+- 官方二进制下载后经过 SHA512 完整性校验
+- 不对内核或系统分区做任何修改
+
+---
+
+## 安装与部署
 
 在您的 **Termux** 终端中拷贝并运行以下一键安装命令：
 
@@ -51,9 +87,18 @@ cd agy-termux
 bash install-termux.sh
 ```
 
+### 前置依赖
+
+安装脚本会自动处理以下依赖：
+- `grun`（glibc-runner）
+- `clang` 编译器
+- `ca-certificates`（HTTPS 证书，用于 OAuth2 认证）
+- `curl` 或 `wget`
+- `tar`、`sha512sum`
+
 ---
 
-## 🔍 验证与使用
+## 验证与使用
 
 安装完成后，直接调用系统注册的包装器命令以验证版本：
 
@@ -62,32 +107,47 @@ agy --version
 ```
 
 在 Termux 终端中启动您的智能编程助理：
+
 ```bash
 agy
 ```
 
----
-
-## 🛠️ 运行架构设计
-
-```
-用户输入命令 [agy]
-       │
-       ▼
-执行路径启动器包装脚本 [$PREFIX/bin/agy]
-       │
-       ▼
-重定向至 glibc-runner 解释器 [grun]
-       │
-       ▼
-加载精简版 glibc 动态运行库环境
-       │
-       ▼
-执行官方标准的 linux_arm64 原生机器码 ELF 二进制文件
-```
+首次运行需要通过浏览器完成 Google OAuth2 认证。
 
 ---
 
-## 📝 许可证
+## 常见问题
+
+### OAuth2 token exchange 失败
+
+如果 `agy` 在执行 `agy auth login` 时提示连接错误，通常是因为 CA 证书或网络代理问题：
+
+1. 确认 `ca-certificates` 包已安装：
+   ```bash
+   pkg install ca-certificates
+   ```
+2. 如果使用代理（如 Clash、v2ray），设置环境变量：
+   ```bash
+   export HTTP_PROXY=http://127.0.0.1:7890
+   export HTTPS_PROXY=http://127.0.0.1:7890
+   agy auth login
+   ```
+3. 确认 SSL_CERT_FILE 路径正确：
+   ```bash
+   ls -l $SSL_CERT_FILE
+   ```
+
+### 安全升级
+
+由于 Termux 下的 agy 包含 35-bit 降维与 FIPS 完整性签名补丁，直接运行 `agy update` 会导致补丁失效。
+请使用以下命令进行安全升级：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash
+```
+
+---
+
+## 许可证
 
 本项目基于 MIT 许可证开源。

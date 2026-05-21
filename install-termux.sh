@@ -54,6 +54,29 @@ WRAPPER_PATH="$PREFIX/bin/agy"
 # Ensure crucial directories exist
 mkdir -p "$PREFIX/bin" "$STAGING_DIR" "$INSTALL_DIR"
 
+# 3.5. Install CA certificates for HTTPS (needed by Go's crypto/x509 in agy)
+info "Ensuring CA certificates are installed..."
+if command -v pkg &>/dev/null; then
+    pkg install -y ca-certificates 2>/dev/null || true
+fi
+# Auto-detect cert file location
+CERT_PATH=""
+for p in \
+    "$PREFIX/etc/tls/cert.pem" \
+    "$PREFIX/etc/ssl/cert.pem" \
+    "/system/etc/security/cacerts" \
+    "$PREFIX/etc/ca-certificates.crt"; do
+    if [ -f "$p" ] || [ -d "$p" ]; then
+        CERT_PATH="$p"
+        break
+    fi
+done
+if [ -z "$CERT_PATH" ]; then
+    warn "No CA certificate bundle found. Attempting fallback path: $PREFIX/etc/tls/cert.pem"
+    CERT_PATH="$PREFIX/etc/tls/cert.pem"
+fi
+success "CA certificates resolved: $CERT_PATH"
+
 # 4. Install & Verify glibc-runner (grun)
 if ! command -v grun &>/dev/null; then
     info "glibc-runner (grun) not found. Attempting automatic installation..."
@@ -739,7 +762,8 @@ if [ -z "$LD_SO" ]; then
 # using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
-export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
+export SSL_CERT_FILE=$CERT_PATH
+export CURL_CA_BUNDLE=$CERT_PATH
 
 # Secure update interceptor to protect patches and glibc environment from native overwrite
 if [ "\$1" = "update" ]; then
@@ -760,7 +784,8 @@ else
 # using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
-export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
+export SSL_CERT_FILE=$CERT_PATH
+export CURL_CA_BUNDLE=$CERT_PATH
 
 # Secure update interceptor to protect patches and glibc environment from native overwrite
 if [ "\$1" = "update" ]; then
