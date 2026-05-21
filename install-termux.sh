@@ -186,64 +186,185 @@ fi
 chmod +x "$INSTALL_DIR/antigravity"
 success "Binary staged successfully."
 
-# 8. Compile TCMalloc 48-bit Virtual Address Shim
-info "Engineering self-contained virtual address mapping shim..."
-cat << 'EOF' > "$INSTALL_DIR/mmap_shim.c"
-typedef unsigned long size_t;
-typedef long off_t;
-typedef long off64_t;
-#define NULL ((void *)0)
+# 8. Compile TCMalloc 48-bit Virtual Address Tracer
+info "Engineering self-contained ptrace syscall interception tracer..."
+cat << 'EOF' > "$INSTALL_DIR/agy_ptrace_tracer.c"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/uio.h>
+#include <errno.h>
+#include <signal.h>
 
-static inline long my_syscall6(long num, long arg1, long arg2, long arg3, long arg4, long arg5, long arg6) {
-    register long x8 __asm__("x8") = num;
-    register long x0 __asm__("x0") = arg1;
-    register long x1 __asm__("x1") = arg2;
-    register long x2 __asm__("x2") = arg3;
-    register long x3 __asm__("x3") = arg4;
-    register long x4 __asm__("x4") = arg5;
-    register long x5 __asm__("x5") = arg6;
-    __asm__ __volatile__(
-        "svc #0"
-        : "+r"(x0)
-        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
-        : "memory"
-    );
-    return x0;
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+
+// ARM64 register structure as defined by the ARM64 Linux ABI
+struct custom_pt_regs {
+    unsigned long long regs[31]; // x0 to x30
+    unsigned long long sp;
+    unsigned long long pc;
+    unsigned long long pstate;
+};
+
+#define MAX_THREADS 1024
+
+struct ThreadState {
+    pid_t pid;
+    int in_syscall;
+} threads[MAX_THREADS];
+
+int get_thread_index(pid_t pid) {
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (threads[i].pid == pid) {
+            return i;
+        }
+    }
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (threads[i].pid == 0) {
+            threads[i].pid = pid;
+            threads[i].in_syscall = 0;
+            return i;
+        }
+    }
+    return -1;
 }
 
-void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    if (addr != NULL && (unsigned long)addr >= 0x8000000000ULL) { // 39-bit limit (512GB)
-        addr = NULL;
+void remove_thread(pid_t pid) {
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (threads[i].pid == pid) {
+            threads[i].pid = 0;
+            threads[i].in_syscall = 0;
+            break;
+        }
     }
-    long res = my_syscall6(222, (long)addr, (long)length, (long)prot, (long)flags, (long)fd, (long)offset);
-    if ((unsigned long)res >= (unsigned long)-4095) {
-        return (void *)-1;
-    }
-    return (void *)res;
 }
 
-void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
-    if (addr != NULL && (unsigned long)addr >= 0x8000000000ULL) { // 39-bit limit (512GB)
-        addr = NULL;
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <program> [args...]\n", argv[0]);
+        return 1;
     }
-    long res = my_syscall6(222, (long)addr, (long)length, (long)prot, (long)flags, (long)fd, (long)offset);
-    if ((unsigned long)res >= (unsigned long)-4095) {
-        return (void *)-1;
+
+    pid_t child = fork();
+    if (child < 0) {
+        perror("fork");
+        return 1;
     }
-    return (void *)res;
+
+    if (child == 0) {
+        // Child: attach and stop before executing
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+            perror("ptrace TRACEME");
+            exit(1);
+        }
+        raise(SIGSTOP);
+        
+        execvp(argv[1], &argv[1]);
+        perror("execvp");
+        exit(1);
+    }
+
+    // Parent
+    int status;
+    if (waitpid(child, &status, 0) < 0) {
+        perror("waitpid");
+        return 1;
+    }
+
+    // Configure options to trace child, clones, forks, and enable sysgood stops (SIGTRAP | 0x80)
+    long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | 
+                   PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | 
+                   PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT;
+    ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)options);
+
+    // Start system call tracing
+    ptrace(PTRACE_SYSCALL, child, NULL, NULL);
+
+    memset(threads, 0, sizeof(threads));
+
+    while (1) {
+        pid_t pid = waitpid(-1, &status, __WALL);
+        if (pid < 0) {
+            if (errno == ECHILD) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("waitpid");
+            break;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            remove_thread(pid);
+            if (pid == child) {
+                if (WIFEXITED(status)) {
+                    return WEXITSTATUS(status);
+                } else {
+                    return 128 + WTERMSIG(status);
+                }
+            }
+            continue;
+        }
+
+        if (WIFSTOPPED(status)) {
+            int sig = WSTOPSIG(status);
+            
+            if (sig == (SIGTRAP | 0x80)) {
+                int idx = get_thread_index(pid);
+                if (idx != -1) {
+                    threads[idx].in_syscall = !threads[idx].in_syscall;
+                    
+                    if (threads[idx].in_syscall) {
+                        struct custom_pt_regs regs;
+                        struct iovec iov;
+                        iov.iov_base = &regs;
+                        iov.iov_len = sizeof(regs);
+                        
+                        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0) {
+                            // On AArch64:
+                            // regs.regs[8] is x8 (syscall number)
+                            // regs.regs[0] is x0 (first argument - hint address)
+                            // __NR_mmap is 222
+                            if (regs.regs[8] == 222) {
+                                unsigned long long hint = regs.regs[0];
+                                if (hint >= 0x8000000000ULL) { // 39-bit VA space limit (512GB)
+                                    regs.regs[0] = 0; // Strip the high address hint to NULL
+                                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+                                }
+                            }
+                        }
+                    }
+                }
+                ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+                continue;
+            }
+            
+            // Forward signal to the tracee
+            int deliver_sig = (sig == SIGTRAP || sig == (SIGTRAP | 0x80)) ? 0 : sig;
+            ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)deliver_sig);
+        }
+    }
+
+    return 0;
 }
 EOF
 
-info "Compiling virtual address shim library on-device..."
-if clang -O3 -fPIC -shared -nostdlib -o "$INSTALL_DIR/libmmap_shim.so" "$INSTALL_DIR/mmap_shim.c"; then
-    success "Self-contained shim compiled successfully."
+info "Compiling virtual address tracer on-device..."
+if clang -O3 -Wall -o "$INSTALL_DIR/agy_ptrace_tracer" "$INSTALL_DIR/agy_ptrace_tracer.c"; then
+    success "Self-contained ptrace tracer compiled successfully."
 else
-    error "Failed to compile the virtual address shim. Verify your Termux compiler setup."
+    error "Failed to compile the ptrace tracer. Verify your Termux compiler setup."
     exit 1
 fi
 
 # Remove temporary source file to keep installation clean
-rm -f "$INSTALL_DIR/mmap_shim.c"
+rm -f "$INSTALL_DIR/agy_ptrace_tracer.c"
 
 # 9. Create Launcher Wrapper
 info "Locating glibc dynamic linker and library path..."
@@ -272,10 +393,9 @@ if [ -z "$LD_SO" ]; then
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
-# with custom TCMalloc virtual address space mapping correction (fallback).
+# using native ptrace-based syscall interception for TCMalloc mapping correction.
 #
-export LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so"
-exec grun "$INSTALL_DIR/antigravity" "\$@"
+exec "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" "\$@"
 EOF
 else
     success "Located glibc dynamic linker at $LD_SO"
@@ -283,10 +403,9 @@ else
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
-# with custom TCMalloc virtual address space mapping correction (direct-link).
+# using native ptrace-based syscall interception for TCMalloc mapping correction.
 #
-export LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so"
-exec "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
+exec "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
 EOF
 fi
 
@@ -295,15 +414,15 @@ success "Wrapper created and executable bits set."
 
 # 10. Initialization Handoff
 info "Configuring Termux environment dependencies..."
-# Execute native configuration with the shim preloaded
+# Execute native configuration with the syscall tracer active
 if [ -n "$LD_SO" ]; then
-    if LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+    if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
         success "Shell configurations initialized."
     else
         warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
     fi
 else
-    if LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+    if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
         success "Shell configurations initialized."
     else
         warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
