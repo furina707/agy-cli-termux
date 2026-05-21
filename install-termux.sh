@@ -57,10 +57,21 @@ if ! command -v grun &>/dev/null; then
     info "glibc-runner (grun) not found. Attempting automatic installation..."
     if command -v pkg &>/dev/null; then
         pkg update -y -q || true
-        if pkg install -y grun 2>/dev/null || pkg install -y glibc-runner 2>/dev/null; then
-            success "glibc-runner (grun) installed successfully."
+        # Install glibc-repo first to make glibc-runner package available
+        info "Installing glibc-repo repository dependency..."
+        pkg install -y glibc-repo 2>/dev/null || true
+        pkg update -y -q || true
+        
+        info "Installing glibc-runner package..."
+        if pkg install -y glibc-runner 2>/dev/null || pkg install -y grun 2>/dev/null; then
+            if command -v grun &>/dev/null; then
+                success "glibc-runner (grun) installed successfully."
+            else
+                error "Package appeared to install, but 'grun' command is still not found."
+                exit 1
+            fi
         else
-            error "Failed to install 'grun' automatically. Please run 'pkg install grun' manually."
+            error "Failed to install 'glibc-runner' automatically. Please run 'pkg install glibc-repo && pkg install glibc-runner' manually."
             exit 1
         fi
     else
