@@ -228,6 +228,7 @@ int get_thread_index(pid_t pid) {
         if (threads[i].pid == 0) {
             threads[i].pid = pid;
             threads[i].in_syscall = 0;
+            fprintf(stderr, "[TRACER INFO] Tracking new thread/process pid=%d\n", pid);
             return i;
         }
     }
@@ -239,6 +240,7 @@ void remove_thread(pid_t pid) {
         if (threads[i].pid == pid) {
             threads[i].pid = 0;
             threads[i].in_syscall = 0;
+            fprintf(stderr, "[TRACER INFO] Stopped tracking pid=%d\n", pid);
             break;
         }
     }
@@ -249,6 +251,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <program> [args...]\n", argv[0]);
         return 1;
     }
+
+    fprintf(stderr, "[TRACER START] Launching tracer wrapper...\n");
 
     pid_t child = fork();
     if (child < 0) {
@@ -280,17 +284,26 @@ int main(int argc, char *argv[]) {
     long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | 
                    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | 
                    PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT;
-    ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)options);
+    if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)options) < 0) {
+        perror("[TRACER ERROR] ptrace SETOPTIONS failed");
+    } else {
+        fprintf(stderr, "[TRACER INFO] Ptrace options successfully set on initial child\n");
+    }
 
     // Start system call tracing
-    ptrace(PTRACE_SYSCALL, child, NULL, NULL);
+    if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) < 0) {
+        perror("[TRACER ERROR] Initial ptrace SYSCALL failed");
+    }
 
     memset(threads, 0, sizeof(threads));
+    // Initialize the main child thread in our table
+    get_thread_index(child);
 
     while (1) {
         pid_t pid = waitpid(-1, &status, __WALL);
         if (pid < 0) {
             if (errno == ECHILD) {
+                fprintf(stderr, "[TRACER INFO] No more children to track. Exiting tracer.\n");
                 break;
             }
             if (errno == EINTR) {
@@ -301,6 +314,11 @@ int main(int argc, char *argv[]) {
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (WIFEXITED(status)) {
+                fprintf(stderr, "[TRACER INFO] pid=%d exited with status %d\n", pid, WEXITSTATUS(status));
+            } else {
+                fprintf(stderr, "[TRACER INFO] pid=%d killed by signal %d\n", pid, WTERMSIG(status));
+            }
             remove_thread(pid);
             if (pid == child) {
                 if (WIFEXITED(status)) {
@@ -314,16 +332,23 @@ int main(int argc, char *argv[]) {
 
         if (WIFSTOPPED(status)) {
             int sig = WSTOPSIG(status);
+            int event = status >> 16;
             
+            if (event != 0) {
+                fprintf(stderr, "[TRACER EVENT] pid=%d received ptrace event %d (sig=%d)\n", pid, event, sig);
+            }
+
             // Check for PTRACE_EVENT_EXEC
-            if (sig == SIGTRAP && ((status >> 16) == PTRACE_EVENT_EXEC)) {
-                // Reset state: execve destroys all other threads and replaces the memory image
+            if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
+                fprintf(stderr, "[TRACER EXEC] PTRACE_EVENT_EXEC triggered for pid=%d. Resetting tracking table...\n", pid);
                 memset(threads, 0, sizeof(threads));
                 int idx = get_thread_index(pid);
                 if (idx != -1) {
                     threads[idx].in_syscall = 0;
                 }
-                ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+                if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) < 0) {
+                    perror("[TRACER ERROR] ptrace SYSCALL failed after EXEC");
+                }
                 continue;
             }
             
@@ -332,34 +357,54 @@ int main(int argc, char *argv[]) {
                 if (idx != -1) {
                     threads[idx].in_syscall = !threads[idx].in_syscall;
                     
-                    if (threads[idx].in_syscall) {
-                        struct custom_pt_regs regs;
-                        struct iovec iov;
-                        iov.iov_base = &regs;
-                        iov.iov_len = sizeof(regs);
+                    struct custom_pt_regs regs;
+                    struct iovec iov;
+                    iov.iov_base = &regs;
+                    iov.iov_len = sizeof(regs);
+                    
+                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0) {
+                        unsigned long long syscall_num = regs.regs[8];
                         
-                        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0) {
-                            // On AArch64:
-                            // regs.regs[8] is x8 (syscall number)
-                            // regs.regs[0] is x0 (first argument - hint address)
-                            // __NR_mmap is 222
-                            if (regs.regs[8] == 222) {
+                        if (syscall_num == 222) { // __NR_mmap
+                            fprintf(stderr, "[TRACER SYSCALL] pid=%d: mmap (222) %s: addr=0x%llx, len=0x%llx, prot=0x%llx, flags=0x%llx, fd=%lld, off=0x%llx\n",
+                                    pid, threads[idx].in_syscall ? "ENTRY" : "EXIT",
+                                    regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3],
+                                    (long long)regs.regs[4], regs.regs[5]);
+                            
+                            if (threads[idx].in_syscall) {
                                 unsigned long long hint = regs.regs[0];
-                                if (hint >= 0x8000000000ULL) { // 39-bit VA space limit (512GB)
+                                if (hint >= 0x8000000000ULL) { // 39-bit VA space limit
                                     regs.regs[0] = 0; // Strip the high address hint to NULL
-                                    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+                                    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0) {
+                                        fprintf(stderr, "[TRACER MMAP] Overwrote high address hint (0x%llx) to NULL for pid=%d\n", hint, pid);
+                                    } else {
+                                        perror("[TRACER ERROR] Failed to set register x0 to NULL");
+                                    }
                                 }
                             }
                         }
+                    } else {
+                        perror("[TRACER ERROR] ptrace GETREGSET failed");
                     }
                 }
-                ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+                if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) < 0) {
+                    perror("[TRACER ERROR] ptrace SYSCALL failed after sysgood stop");
+                }
                 continue;
             }
             
-            // Forward signal to the tracee
-            int deliver_sig = (sig == SIGTRAP || sig == (SIGTRAP | 0x80)) ? 0 : sig;
-            ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)deliver_sig);
+            // Suppress the initial SIGSTOP of a new thread/process to prevent it from halting
+            int deliver_sig = sig;
+            if (sig == SIGSTOP) {
+                fprintf(stderr, "[TRACER INFO] Suppressing SIGSTOP for pid=%d\n", pid);
+                deliver_sig = 0;
+            } else if (sig == SIGTRAP) {
+                deliver_sig = 0;
+            }
+
+            if (ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)deliver_sig) < 0) {
+                fprintf(stderr, "[TRACER ERROR] ptrace SYSCALL failed for signal %d on pid=%d: %s\n", sig, pid, strerror(errno));
+            }
         }
     }
 
