@@ -56,7 +56,10 @@ mkdir -p "$PREFIX/bin" "$STAGING_DIR" "$INSTALL_DIR"
 if ! command -v grun &>/dev/null; then
     info "glibc-runner (grun) not found. Attempting automatic installation..."
     if command -v pkg &>/dev/null; then
+        info "Updating and upgrading Termux packages (this may take a moment)..."
         pkg update -y || true
+        pkg upgrade -y -o Dpkg::Options::="--force-confold" || true
+        
         # Install glibc-repo first to make glibc-runner package available
         info "Installing glibc-repo repository dependency..."
         pkg install -y glibc-repo || true
