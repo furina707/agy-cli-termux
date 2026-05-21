@@ -14,7 +14,17 @@ Antigravity CLI 官方发布的 Linux ARM64 二进制文件是针对标准 Linux
 
 ## ⚡ 解决方案 (方案 B)
 
-本项目通过自动配置 **`glibc-runner` (`grun`)** 建立一个轻量级的动态兼容桥梁，从而彻底解决兼容性问题。
+本项目通过自动配置 **`glibc-runner` (`grun`)** 建立一个轻量级的动态兼容桥梁，并集成了定制的内存垫片，彻底解决兼容性问题。
+
+### 🌟 TCMalloc 48-bit 虚拟地址空间崩溃修复
+官方编译的 Linux ARM64 二进制文件静态链接了 Google 的 **TCMalloc** 高性能内存分配器。该分配器硬编码假定操作系统拥有 **48-bit 虚拟地址空间**（桌面/服务器 Linux 标准），并在初始化时尝试 `mmap` 寻址超高的地址空间（例如错误日志中的 `hint=0x4e88c0000000`，即 ~78.5 TiB 处）。
+然而，几乎所有 Android 设备的 ARM64 内核均配置为 **39-bit 虚拟地址空间**（最大寻址空间为 512 GiB，即上限为 `0x8000000000`）。当静态 TCMalloc 触发建议地址位于 48-bit 的 `mmap` 系统调用时，Android 内核将直接拒绝该越界寻址，导致程序抛出 `MmapAligned() failed - unable to allocate with tag` 并 Fatal OOM 闪退。
+
+为了在**不修改内核、不改变 PRoot 隔离、不重构官方静态二进制程序**的前提下解决该底层硬件/内核级限制，本项目实现了以下高阶适配方案：
+1. **本地自包含即时编译**：适配脚本将自动在 Termux 本地通过 `clang` 即时编译一个垫片库 `libmmap_shim.so`。
+2. **纯自包含零依赖 (-nostdlib)**：垫片库采用纯自包含设计（不依赖任何 glibc 或 Bionic libc 动态库），使得它可以被 Bionic linker（如运行中的包装脚本或 `grun` 自身）与 Glibc Linker（如 `agy` 原生程序）同时安全加载，**不产生任何 dynamic linker 警告或运行时符号冲突**。
+3. **高位建议地址过滤**：使用底层的 ARM64 原生内联汇编系统调用指令（`svc #0`）代理 `mmap` 和 `mmap64`。当检测到 `addr` 建议参数超出 39-bit（`>= 0x8000000000`）时，垫片自动将其剥离重置为 `NULL`，强制内核分配安全的 39-bit 虚拟内存空间（完美兼容 48-bit  radix 树的低位寻址）。
+4. **环境包装拦截**：生成执行包装器 `$PREFIX/bin/agy`，通过预加载（`LD_PRELOAD`）把垫片无感知地注入到执行会话中，实现完美平滑启动。
 
 本安装适配脚本 (`install-termux.sh`) 将自动完成以下工作：
 1. 自动检测设备 CPU 架构，确保为 `aarch64` (ARM64) 架构。

@@ -94,6 +94,19 @@ else
     success "glibc-runner (grun) is already installed."
 fi
 
+# 4.5 Install & Verify Clang compiler
+if ! command -v clang &>/dev/null; then
+    info "Clang compiler not found. Attempting automatic installation..."
+    if pkg install -y clang; then
+        success "Clang compiler installed successfully."
+    else
+        error "Failed to install 'clang' automatically."
+        exit 1
+    fi
+else
+    success "Clang compiler is already installed."
+fi
+
 # 5. Fetch Manifest
 DOWNLOAD_BASE_URL="https://antigravity-cli-auto-updater-974169037036.us-central1.run.app"
 MANIFEST_URL="$DOWNLOAD_BASE_URL/manifests/linux_arm64.json"
@@ -173,23 +186,84 @@ fi
 chmod +x "$INSTALL_DIR/antigravity"
 success "Binary staged successfully."
 
-# 8. Create Launcher Wrapper
+# 8. Compile TCMalloc 48-bit Virtual Address Shim
+info "Engineering self-contained virtual address mapping shim..."
+cat << 'EOF' > "$INSTALL_DIR/mmap_shim.c"
+typedef unsigned long size_t;
+typedef long off_t;
+typedef long off64_t;
+#define NULL ((void *)0)
+
+static inline long my_syscall6(long num, long arg1, long arg2, long arg3, long arg4, long arg5, long arg6) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = arg1;
+    register long x1 __asm__("x1") = arg2;
+    register long x2 __asm__("x2") = arg3;
+    register long x3 __asm__("x3") = arg4;
+    register long x4 __asm__("x4") = arg5;
+    register long x5 __asm__("x5") = arg6;
+    __asm__ __volatile__(
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "memory"
+    );
+    return x0;
+}
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if (addr != NULL && (unsigned long)addr >= 0x8000000000ULL) { // 39-bit limit (512GB)
+        addr = NULL;
+    }
+    long res = my_syscall6(222, (long)addr, (long)length, (long)prot, (long)flags, (long)fd, (long)offset);
+    if ((unsigned long)res >= (unsigned long)-4095) {
+        return (void *)-1;
+    }
+    return (void *)res;
+}
+
+void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
+    if (addr != NULL && (unsigned long)addr >= 0x8000000000ULL) { // 39-bit limit (512GB)
+        addr = NULL;
+    }
+    long res = my_syscall6(222, (long)addr, (long)length, (long)prot, (long)flags, (long)fd, (long)offset);
+    if ((unsigned long)res >= (unsigned long)-4095) {
+        return (void *)-1;
+    }
+    return (void *)res;
+}
+EOF
+
+info "Compiling virtual address shim library on-device..."
+if clang -O3 -fPIC -shared -nostdlib -o "$INSTALL_DIR/libmmap_shim.so" "$INSTALL_DIR/mmap_shim.c"; then
+    success "Self-contained shim compiled successfully."
+else
+    error "Failed to compile the virtual address shim. Verify your Termux compiler setup."
+    exit 1
+fi
+
+# Remove temporary source file to keep installation clean
+rm -f "$INSTALL_DIR/mmap_shim.c"
+
+# 9. Create Launcher Wrapper
 info "Creating dynamic launch wrapper at $WRAPPER_PATH..."
 cat << EOF > "$WRAPPER_PATH"
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
+# with custom TCMalloc virtual address space mapping correction.
 #
+export LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so"
 exec grun "$INSTALL_DIR/antigravity" "\$@"
 EOF
 
 chmod +x "$WRAPPER_PATH"
 success "Wrapper created and executable bits set."
 
-# 9. Initialization Handoff
+# 10. Initialization Handoff
 info "Configuring Termux environment dependencies..."
-# Execute native configuration through glibc-runner
-if grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+# Execute native configuration through glibc-runner with the shim preloaded
+if LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
     success "Shell configurations initialized."
 else
     warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
