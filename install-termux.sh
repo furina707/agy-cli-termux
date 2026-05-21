@@ -717,6 +717,15 @@ if [ -z "$LD_SO" ]; then
 #
 unset LD_PRELOAD
 export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
+
+# Secure update interceptor to protect patches and glibc environment from native overwrite
+if [ "\$1" = "update" ]; then
+    echo -e "\033[33mℹ Termux 兼容层提示：由于 Termux 下的 agy 包含 35-bit 降维与 FIPS 完整性签名补丁，直接使用官方二进制升级会导致程序失效。\033[0m"
+    echo -e "\033[36m👉 如需安全升级，请运行以下一键安全升级命令：\033[0m"
+    echo -e "   curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash"
+    exit 0
+fi
+
 exec "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" "\$@"
 EOF
 else
@@ -729,11 +738,23 @@ else
 #
 unset LD_PRELOAD
 export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
+
+# Secure update interceptor to protect patches and glibc environment from native overwrite
+if [ "\$1" = "update" ]; then
+    echo -e "\033[33mℹ Termux 兼容层提示：由于 Termux 下的 agy 包含 35-bit 降维与 FIPS 完整性签名补丁，直接使用官方二进制升级会导致程序失效。\033[0m"
+    echo -e "\033[36m👉 如需安全升级，请运行以下一键安全升级命令：\033[0m"
+    echo -e "   curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash"
+    exit 0
+fi
+
 exec "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
 EOF
 fi
 
 chmod +x "$WRAPPER_PATH"
+if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
+    chmod 555 "$LD_SO" || true
+fi
 success "Wrapper created and executable bits set."
 
 echo ""
