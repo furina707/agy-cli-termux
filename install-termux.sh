@@ -315,6 +315,18 @@ int main(int argc, char *argv[]) {
         if (WIFSTOPPED(status)) {
             int sig = WSTOPSIG(status);
             
+            // Check for PTRACE_EVENT_EXEC
+            if (sig == SIGTRAP && ((status >> 16) == PTRACE_EVENT_EXEC)) {
+                // Reset state: execve destroys all other threads and replaces the memory image
+                memset(threads, 0, sizeof(threads));
+                int idx = get_thread_index(pid);
+                if (idx != -1) {
+                    threads[idx].in_syscall = 0;
+                }
+                ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+                continue;
+            }
+            
             if (sig == (SIGTRAP | 0x80)) {
                 int idx = get_thread_index(pid);
                 if (idx != -1) {
