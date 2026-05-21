@@ -395,6 +395,7 @@ if [ -z "$LD_SO" ]; then
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
 # using native ptrace-based syscall interception for TCMalloc mapping correction.
 #
+unset LD_PRELOAD
 exec "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" "\$@"
 EOF
 else
@@ -405,6 +406,7 @@ else
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
 # using native ptrace-based syscall interception for TCMalloc mapping correction.
 #
+unset LD_PRELOAD
 exec "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
 EOF
 fi
@@ -415,19 +417,23 @@ success "Wrapper created and executable bits set."
 # 10. Initialization Handoff
 info "Configuring Termux environment dependencies..."
 # Execute native configuration with the syscall tracer active
-if [ -n "$LD_SO" ]; then
-    if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
-        success "Shell configurations initialized."
+# Unset LD_PRELOAD during setup to prevent glibc dynamic linker from loading Bionic libtermux-exec.so
+(
+    unset LD_PRELOAD
+    if [ -n "$LD_SO" ]; then
+        if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+            success "Shell configurations initialized."
+        else
+            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+        fi
     else
-        warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+        if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+            success "Shell configurations initialized."
+        else
+            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+        fi
     fi
-else
-    if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
-        success "Shell configurations initialized."
-    else
-        warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
-    fi
-fi
+)
 
 echo ""
 echo -e "${GREEN}==================================================${NC}"
