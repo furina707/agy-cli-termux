@@ -246,27 +246,68 @@ fi
 rm -f "$INSTALL_DIR/mmap_shim.c"
 
 # 9. Create Launcher Wrapper
+info "Locating glibc dynamic linker and library path..."
+GLIBC_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}/glibc"
+LD_SO=""
+if [ -f "$GLIBC_PREFIX/lib/ld-linux-aarch64.so.1" ]; then
+    LD_SO="$GLIBC_PREFIX/lib/ld-linux-aarch64.so.1"
+elif [ -f "$GLIBC_PREFIX/lib/ld.so" ]; then
+    LD_SO="$GLIBC_PREFIX/lib/ld.so"
+else
+    # Fallback search
+    LD_SO=$(find "$GLIBC_PREFIX" -name "ld-linux-aarch64.so.1" -o -name "ld.so" 2>/dev/null | head -n 1 || true)
+fi
+
+GLIBC_LIB_DIR=""
+if [ -n "$LD_SO" ]; then
+    GLIBC_LIB_DIR=$(dirname "$LD_SO")
+else
+    GLIBC_LIB_DIR="$GLIBC_PREFIX/lib"
+fi
+
 info "Creating dynamic launch wrapper at $WRAPPER_PATH..."
-cat << EOF > "$WRAPPER_PATH"
+if [ -z "$LD_SO" ]; then
+    warn "Could not dynamically locate glibc dynamic linker. Falling back to 'grun'..."
+    cat << EOF > "$WRAPPER_PATH"
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
-# with custom TCMalloc virtual address space mapping correction.
+# with custom TCMalloc virtual address space mapping correction (fallback).
 #
 export LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so"
 exec grun "$INSTALL_DIR/antigravity" "\$@"
 EOF
+else
+    success "Located glibc dynamic linker at $LD_SO"
+    cat << EOF > "$WRAPPER_PATH"
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
+# with custom TCMalloc virtual address space mapping correction (direct-link).
+#
+export LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so"
+exec "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
+EOF
+fi
 
 chmod +x "$WRAPPER_PATH"
 success "Wrapper created and executable bits set."
 
 # 10. Initialization Handoff
 info "Configuring Termux environment dependencies..."
-# Execute native configuration through glibc-runner with the shim preloaded
-if LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
-    success "Shell configurations initialized."
+# Execute native configuration with the shim preloaded
+if [ -n "$LD_SO" ]; then
+    if LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+        success "Shell configurations initialized."
+    else
+        warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+    fi
 else
-    warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+    if LD_PRELOAD="$INSTALL_DIR/libmmap_shim.so" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+        success "Shell configurations initialized."
+    else
+        warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+    fi
 fi
 
 echo ""
