@@ -716,6 +716,7 @@ if [ -z "$LD_SO" ]; then
 # using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
+export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
 exec "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" "\$@"
 EOF
 else
@@ -727,6 +728,7 @@ else
 # using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
+export SSL_CERT_FILE=/data/data/com.termux/files/usr/etc/tls/cert.pem
 exec "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
 EOF
 fi
