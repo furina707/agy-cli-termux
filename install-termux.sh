@@ -765,6 +765,16 @@ unset LD_PRELOAD
 export SSL_CERT_FILE=$CERT_PATH
 export CURL_CA_BUNDLE=$CERT_PATH
 
+# Proxy fallback: if proxy env vars are not set but a local proxy is detected, auto-configure
+if [ -z "\${HTTP_PROXY:-}" ] && [ -z "\${HTTPS_PROXY:-}" ]; then
+    if command -v curl &>/dev/null; then
+        if curl -s --connect-timeout 1 -o /dev/null http://127.0.0.1:7890 2>/dev/null; then
+            export HTTP_PROXY=http://127.0.0.1:7890
+            export HTTPS_PROXY=http://127.0.0.1:7890
+        fi
+    fi
+fi
+
 # Secure update interceptor to protect patches and glibc environment from native overwrite
 if [ "\$1" = "update" ]; then
     echo -e "\033[33mℹ Termux 兼容层提示：由于 Termux 下的 agy 包含 35-bit 降维与 FIPS 完整性签名补丁，直接使用官方二进制升级会导致程序失效。\033[0m"
@@ -786,6 +796,16 @@ else
 unset LD_PRELOAD
 export SSL_CERT_FILE=$CERT_PATH
 export CURL_CA_BUNDLE=$CERT_PATH
+
+# Proxy fallback: if proxy env vars are not set but a local proxy is detected, auto-configure
+if [ -z "\${HTTP_PROXY:-}" ] && [ -z "\${HTTPS_PROXY:-}" ]; then
+    if command -v curl &>/dev/null; then
+        if curl -s --connect-timeout 1 -o /dev/null http://127.0.0.1:7890 2>/dev/null; then
+            export HTTP_PROXY=http://127.0.0.1:7890
+            export HTTPS_PROXY=http://127.0.0.1:7890
+        fi
+    fi
+fi
 
 # Secure update interceptor to protect patches and glibc environment from native overwrite
 if [ "\$1" = "update" ]; then
