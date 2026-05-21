@@ -4,7 +4,9 @@
 #
 # A custom-engineered installer designed specifically for Android/Termux environments.
 # It automatically installs glibc-runner (grun), downloads the official glibc Linux ARM64
-# dynamic binary, stages it, verifies checksum integrity, and creates a wrapper for execution.
+# dynamic binary, stages it, verifies checksum integrity, compiles on-device C patcher to
+# adapt TCMalloc shifts & FIPS verification, compiles on-device ptrace tracer to bypass
+# faccessat2 SIGSYS crashes, and creates a wrapper for execution.
 #
 
 set -euo pipefail
@@ -186,8 +188,227 @@ fi
 chmod +x "$INSTALL_DIR/antigravity"
 success "Binary staged successfully."
 
-# 8. Compile TCMalloc 48-bit Virtual Address Tracer
-info "Engineering self-contained ptrace syscall interception tracer..."
+# 8. Compile TCMalloc 35-bit & FIPS Patcher on-device
+info "Engineering self-contained binary patcher..."
+cat << 'EOF' > "$INSTALL_DIR/agy_patcher.c"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+void patch_fips(unsigned char *data, size_t size) {
+    unsigned char expected[32] = {
+        0x90, 0x94, 0x62, 0x7e, 0x2b, 0xd0, 0x3d, 0x96, 
+        0x2b, 0xa1, 0xd0, 0xc4, 0x42, 0x0a, 0x1d, 0xa9, 
+        0xe1, 0xae, 0x55, 0xca, 0xef, 0x8e, 0xde, 0x7b, 
+        0x68, 0x02, 0x8d, 0x7a, 0x4a, 0x71, 0xf1, 0x61
+    };
+    unsigned char calculated[32] = {
+        0xca, 0xe6, 0x01, 0xae, 0xec, 0x02, 0x16, 0xca, 
+        0xd2, 0x04, 0x27, 0x98, 0xd4, 0x77, 0x76, 0xec, 
+        0x63, 0x3f, 0x59, 0x0f, 0x53, 0x71, 0xfa, 0xaf, 
+        0x2f, 0x04, 0x6b, 0x94, 0x14, 0x69, 0xe9, 0x98
+    };
+
+    size_t count = 0;
+    for (size_t i = 0; i <= size - 32; i++) {
+        if (memcmp(&data[i], expected, 32) == 0) {
+            memcpy(&data[i], calculated, 32);
+            printf("[PATCHER FIPS] Patched expected hash at offset 0x%zx\n", i);
+            count++;
+        }
+    }
+    printf("[PATCHER FIPS] Total patched: %zu\n", count);
+}
+
+void patch_tcmalloc(unsigned char *data, size_t size) {
+    size_t ubfx = 0, lsr = 0, lsl = 0, asr = 0;
+    size_t and_ext = 0, tst_tag = 0;
+    size_t movz_n = 0, movz_c = 0, movz_s = 0;
+    size_t movk_n = 0, movk_c = 0, movk_s = 0;
+
+    for (size_t offset = 0; offset <= size - 4; offset += 4) {
+        unsigned int *ptr = (unsigned int *)&data[offset];
+        unsigned int val = *ptr;
+
+        // 1. ubfx Xd, Xn, #42, #3 -> #35, #3
+        if ((val & 0xfffffc00) == 0xd36ab000) {
+            unsigned int rn = (val >> 5) & 0x1f;
+            unsigned int rd = val & 0x1f;
+            if (rn < 31 && rd < 31) {
+                *ptr = 0xd3639400 | (rn << 5) | rd;
+                ubfx++;
+            }
+        }
+        // 2. lsr Xd, Xn, #42 -> #35
+        else if ((val & 0xfffffc00) == 0xd36afc00) {
+            unsigned int rn = (val >> 5) & 0x1f;
+            unsigned int rd = val & 0x1f;
+            if (rn < 31 && rd < 31) {
+                *ptr = 0xd363fc00 | (rn << 5) | rd;
+                lsr++;
+            }
+        }
+        // 3. lsl Xd, Xn, #42 -> #35
+        else if ((val & 0xfffffc00) == 0xd3565400) {
+            unsigned int rn = (val >> 5) & 0x1f;
+            unsigned int rd = val & 0x1f;
+            if (rn < 31 && rd < 31) {
+                *ptr = 0xd35d7000 | (rn << 5) | rd;
+                lsl++;
+            }
+        }
+        // 4. asr Xd, Xn, #42 -> #35
+        else if ((val & 0xfffffc00) == 0x936afc00) {
+            unsigned int rn = (val >> 5) & 0x1f;
+            unsigned int rd = val & 0x1f;
+            if (rn < 31 && rd < 31) {
+                *ptr = 0x9363fc00 | (rn << 5) | rd;
+                asr++;
+            }
+        }
+        // TCMalloc metadata patches (.text restricted range)
+        else if (offset >= 0x49f0000 && offset <= 0x4a90000) {
+            // 5. and Xd, Xn, #0x1c0000000000 -> #0x3800000000
+            if ((val & 0xfffffc00) == 0x92560800) {
+                unsigned int rn = (val >> 5) & 0x1f;
+                unsigned int rd = val & 0x1f;
+                if (rn < 31 && rd < 31) {
+                    *ptr = 0x925d0800 | (rn << 5) | rd;
+                    and_ext++;
+                }
+            }
+            // 6. tst Xn, #0x1c0000000000 -> #0x3800000000
+            else if ((val & 0xfffffc00) == 0xf2560800) {
+                unsigned int rn = (val >> 5) & 0x1f;
+                unsigned int rd = val & 0x1f;
+                if (rn < 31 && rd == 0x1f) {
+                    *ptr = 0xf25d0800 | (rn << 5) | rd;
+                    tst_tag++;
+                }
+            }
+            // 7. movz Xd, imm16, lsl #32
+            else if ((val & 0xffe00000) == 0xd2c00000) {
+                unsigned int imm16 = (val >> 5) & 0xffff;
+                unsigned int rd = val & 0x1f;
+                if (rd < 31) {
+                    if (imm16 == 0x1000) {
+                        *ptr = 0xd2c00000 | (0x20 << 5) | rd;
+                        movz_n++;
+                    } else if (imm16 == 0x1800) {
+                        *ptr = 0xd2c00000 | (0x30 << 5) | rd;
+                        movz_c++;
+                    } else if (imm16 == 0x1400) {
+                        *ptr = 0xd2c00000 | (0x28 << 5) | rd;
+                        movz_s++;
+                    }
+                }
+            }
+            // 8. movk Xd, imm16, lsl #32
+            else if ((val & 0xffe00000) == 0xf2c00000) {
+                unsigned int imm16 = (val >> 5) & 0xffff;
+                unsigned int rd = val & 0x1f;
+                if (rd < 31) {
+                    if (imm16 == 0x1000) {
+                        *ptr = 0xf2c00000 | (0x20 << 5) | rd;
+                        movk_n++;
+                    } else if (imm16 == 0x1800) {
+                        *ptr = 0xf2c00000 | (0x30 << 5) | rd;
+                        movk_c++;
+                    } else if (imm16 == 0x1400) {
+                        *ptr = 0xf2c00000 | (0x28 << 5) | rd;
+                        movk_s++;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("[PATCHER TCMALLOC] TCMalloc patching summary:\n");
+    printf("  ubfx: %zu, lsr: %zu, lsl: %zu, asr: %zu\n", ubfx, lsr, lsl, asr);
+    printf("  and_ext: %zu, tst_tag: %zu\n", and_ext, tst_tag);
+    printf("  movz normal/cold/sampled: %zu/%zu/%zu\n", movz_n, movz_c, movz_s);
+    printf("  movk normal/cold/sampled: %zu/%zu/%zu\n", movk_n, movk_c, movk_s);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <input_file> <output_file>\n", argv[0]);
+        return 1;
+    }
+
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        perror("fopen input");
+        return 1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    unsigned char *data = malloc(size);
+    if (!data) {
+        perror("malloc");
+        fclose(f);
+        return 1;
+    }
+
+    if (fread(data, 1, size, f) != size) {
+        perror("fread");
+        free(data);
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+
+    patch_tcmalloc(data, size);
+    patch_fips(data, size);
+
+    FILE *out = fopen(argv[2], "wb");
+    if (!out) {
+        perror("fopen output");
+        free(data);
+        return 1;
+    }
+
+    if (fwrite(data, 1, size, out) != size) {
+        perror("fwrite");
+        fclose(out);
+        free(data);
+        return 1;
+    }
+
+    fclose(out);
+    free(data);
+    printf("[PATCHER] Patched successfully and saved to %s\n", argv[2]);
+    return 0;
+}
+EOF
+
+info "Compiling binary patcher on-device..."
+if clang -O3 -Wall -o "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/agy_patcher.c"; then
+    success "Binary patcher compiled successfully."
+else
+    error "Failed to compile the binary patcher."
+    exit 1
+fi
+
+info "Applying 35-bit TCMalloc and FIPS expected hash patches natively..."
+if "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/antigravity" "$INSTALL_DIR/antigravity_patched"; then
+    success "Binary patched successfully."
+    # Overwrite original binary with the fully patched executable
+    mv -f "$INSTALL_DIR/antigravity_patched" "$INSTALL_DIR/antigravity"
+    chmod +x "$INSTALL_DIR/antigravity"
+else
+    error "Failed to patch binary on-device."
+    exit 1
+fi
+
+# Clean up patcher
+rm -f "$INSTALL_DIR/agy_patcher" "$INSTALL_DIR/agy_patcher.c"
+
+# 8.5. Compile faccessat2 ptrace syscall interception tracer
+info "Engineering self-contained faccessat2 ptrace syscall interception tracer..."
 cat << 'EOF' > "$INSTALL_DIR/agy_ptrace_tracer.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,12 +419,17 @@ cat << 'EOF' > "$INSTALL_DIR/agy_ptrace_tracer.c"
 #include <sys/uio.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <elf.h>
 
 #ifndef NT_PRSTATUS
 #define NT_PRSTATUS 1
 #endif
 
-// ARM64 register structure as defined by the ARM64 Linux ABI
+#ifndef NT_ARM_SYSTEM_CALL
+#define NT_ARM_SYSTEM_CALL 0x404
+#endif
+
 struct custom_pt_regs {
     unsigned long long regs[31]; // x0 to x30
     unsigned long long sp;
@@ -218,7 +444,7 @@ struct ThreadState {
     int in_syscall;
 } threads[MAX_THREADS];
 
-int get_thread_index(pid_t pid) {
+int get_thread_index(pid_t pid, int is_clone) {
     for (int i = 0; i < MAX_THREADS; i++) {
         if (threads[i].pid == pid) {
             return i;
@@ -227,8 +453,7 @@ int get_thread_index(pid_t pid) {
     for (int i = 0; i < MAX_THREADS; i++) {
         if (threads[i].pid == 0) {
             threads[i].pid = pid;
-            threads[i].in_syscall = 0;
-            fprintf(stderr, "[TRACER INFO] Tracking new thread/process pid=%d\n", pid);
+            threads[i].in_syscall = is_clone ? 1 : 0;
             return i;
         }
     }
@@ -240,7 +465,6 @@ void remove_thread(pid_t pid) {
         if (threads[i].pid == pid) {
             threads[i].pid = 0;
             threads[i].in_syscall = 0;
-            fprintf(stderr, "[TRACER INFO] Stopped tracking pid=%d\n", pid);
             break;
         }
     }
@@ -252,8 +476,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    fprintf(stderr, "[TRACER START] Launching tracer wrapper...\n");
-
     pid_t child = fork();
     if (child < 0) {
         perror("fork");
@@ -261,7 +483,6 @@ int main(int argc, char *argv[]) {
     }
 
     if (child == 0) {
-        // Child: attach and stop before executing
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
             perror("ptrace TRACEME");
             exit(1);
@@ -273,37 +494,30 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    // Parent
     int status;
     if (waitpid(child, &status, 0) < 0) {
         perror("waitpid");
         return 1;
     }
 
-    // Configure options to trace child, clones, forks, and enable sysgood stops (SIGTRAP | 0x80)
     long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | 
                    PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | 
                    PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT;
     if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)options) < 0) {
         perror("[TRACER ERROR] ptrace SETOPTIONS failed");
-    } else {
-        fprintf(stderr, "[TRACER INFO] Ptrace options successfully set on initial child\n");
     }
 
-    // Start system call tracing
     if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) < 0) {
         perror("[TRACER ERROR] Initial ptrace SYSCALL failed");
     }
 
     memset(threads, 0, sizeof(threads));
-    // Initialize the main child thread in our table
-    get_thread_index(child);
+    get_thread_index(child, 0);
 
     while (1) {
         pid_t pid = waitpid(-1, &status, __WALL);
         if (pid < 0) {
             if (errno == ECHILD) {
-                fprintf(stderr, "[TRACER INFO] No more children to track. Exiting tracer.\n");
                 break;
             }
             if (errno == EINTR) {
@@ -314,11 +528,6 @@ int main(int argc, char *argv[]) {
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            if (WIFEXITED(status)) {
-                fprintf(stderr, "[TRACER INFO] pid=%d exited with status %d\n", pid, WEXITSTATUS(status));
-            } else {
-                fprintf(stderr, "[TRACER INFO] pid=%d killed by signal %d\n", pid, WTERMSIG(status));
-            }
             remove_thread(pid);
             if (pid == child) {
                 if (WIFEXITED(status)) {
@@ -334,17 +543,11 @@ int main(int argc, char *argv[]) {
             int sig = WSTOPSIG(status);
             int event = status >> 16;
             
-            if (event != 0) {
-                fprintf(stderr, "[TRACER EVENT] pid=%d received ptrace event %d (sig=%d)\n", pid, event, sig);
-            }
-
-            // Check for PTRACE_EVENT_EXEC
             if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
-                fprintf(stderr, "[TRACER EXEC] PTRACE_EVENT_EXEC triggered for pid=%d. Resetting tracking table...\n", pid);
                 memset(threads, 0, sizeof(threads));
-                int idx = get_thread_index(pid);
+                int idx = get_thread_index(pid, 1);
                 if (idx != -1) {
-                    threads[idx].in_syscall = 0;
+                    threads[idx].in_syscall = 1;
                 }
                 if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) < 0) {
                     perror("[TRACER ERROR] ptrace SYSCALL failed after EXEC");
@@ -353,38 +556,34 @@ int main(int argc, char *argv[]) {
             }
             
             if (sig == (SIGTRAP | 0x80)) {
-                int idx = get_thread_index(pid);
+                int idx = get_thread_index(pid, 1);
                 if (idx != -1) {
                     threads[idx].in_syscall = !threads[idx].in_syscall;
                     
-                    struct custom_pt_regs regs;
-                    struct iovec iov;
-                    iov.iov_base = &regs;
-                    iov.iov_len = sizeof(regs);
-                    
-                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0) {
-                        unsigned long long syscall_num = regs.regs[8];
+                    if (threads[idx].in_syscall) {
+                        // Syscall ENTRY stop
+                        int syscall_num;
+                        struct iovec iov;
+                        iov.iov_base = &syscall_num;
+                        iov.iov_len = sizeof(syscall_num);
                         
-                        if (syscall_num == 222) { // __NR_mmap
-                            fprintf(stderr, "[TRACER SYSCALL] pid=%d: mmap (222) %s: addr=0x%llx, len=0x%llx, prot=0x%llx, flags=0x%llx, fd=%lld, off=0x%llx\n",
-                                    pid, threads[idx].in_syscall ? "ENTRY" : "EXIT",
-                                    regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3],
-                                    (long long)regs.regs[4], regs.regs[5]);
-                            
-                            if (threads[idx].in_syscall) {
-                                unsigned long long hint = regs.regs[0];
-                                if (hint >= 0x8000000000ULL) { // 39-bit VA space limit
-                                    regs.regs[0] = 0; // Strip the high address hint to NULL
-                                    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) == 0) {
-                                        fprintf(stderr, "[TRACER MMAP] Overwrote high address hint (0x%llx) to NULL for pid=%d\n", hint, pid);
-                                    } else {
-                                        perror("[TRACER ERROR] Failed to set register x0 to NULL");
+                        if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov) == 0) {
+                            if (syscall_num == 279) { // __NR_faccessat2
+                                syscall_num = -1;
+                                if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov) == 0) {
+                                    struct custom_pt_regs regs;
+                                    struct iovec iov_regs;
+                                    iov_regs.iov_base = &regs;
+                                    iov_regs.iov_len = sizeof(regs);
+                                    
+                                    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs) == 0) {
+                                        regs.regs[0] = -38ULL; // -ENOSYS
+                                        regs.regs[8] = -1ULL;
+                                        ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs);
                                     }
                                 }
                             }
                         }
-                    } else {
-                        perror("[TRACER ERROR] ptrace GETREGSET failed");
                     }
                 }
                 if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) < 0) {
@@ -393,17 +592,15 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             
-            // Suppress the initial SIGSTOP of a new thread/process to prevent it from halting
             int deliver_sig = sig;
             if (sig == SIGSTOP) {
-                fprintf(stderr, "[TRACER INFO] Suppressing SIGSTOP for pid=%d\n", pid);
                 deliver_sig = 0;
             } else if (sig == SIGTRAP) {
                 deliver_sig = 0;
             }
 
             if (ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)deliver_sig) < 0) {
-                fprintf(stderr, "[TRACER ERROR] ptrace SYSCALL failed for signal %d on pid=%d: %s\n", sig, pid, strerror(errno));
+                perror("[TRACER ERROR] ptrace SYSCALL failed for signal");
             }
         }
     }
@@ -472,7 +669,7 @@ if [ -z "$LD_SO" ]; then
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
-# using native ptrace-based syscall interception for TCMalloc mapping correction.
+# using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
 exec "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" "\$@"
@@ -483,7 +680,7 @@ else
 #!/data/data/com.termux/files/usr/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
-# using native ptrace-based syscall interception for TCMalloc mapping correction.
+# using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
 exec "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" "\$@"
