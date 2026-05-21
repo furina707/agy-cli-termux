@@ -56,14 +56,14 @@ mkdir -p "$PREFIX/bin" "$STAGING_DIR" "$INSTALL_DIR"
 if ! command -v grun &>/dev/null; then
     info "glibc-runner (grun) not found. Attempting automatic installation..."
     if command -v pkg &>/dev/null; then
-        pkg update -y -q || true
+        pkg update -y || true
         # Install glibc-repo first to make glibc-runner package available
         info "Installing glibc-repo repository dependency..."
-        pkg install -y glibc-repo 2>/dev/null || true
-        pkg update -y -q || true
+        pkg install -y glibc-repo || true
+        pkg update -y || true
         
         info "Installing glibc-runner package..."
-        if pkg install -y glibc-runner 2>/dev/null || pkg install -y grun 2>/dev/null; then
+        if pkg install -y glibc-runner || pkg install -y grun; then
             if command -v grun &>/dev/null; then
                 success "glibc-runner (grun) installed successfully."
             else
@@ -71,7 +71,16 @@ if ! command -v grun &>/dev/null; then
                 exit 1
             fi
         else
-            error "Failed to install 'glibc-runner' automatically. Please run 'pkg install glibc-repo && pkg install glibc-runner' manually."
+            echo ""
+            error "Failed to install 'glibc-runner' automatically."
+            echo -e "${YELLOW}💡 Troubleshooting Steps:${NC}"
+            echo -e "  1. Your current Termux mirror might be outdated or unreachable."
+            echo -e "     Please run ${CYAN}termux-change-repo${NC} and select an official, updated mirror (e.g., Tsinghua, BFSU, or F-Droid)."
+            echo -e "  2. Perform a complete package upgrade:"
+            echo -e "     ${CYAN}pkg update && pkg upgrade -y${NC}"
+            echo -e "  3. Manually try to install glibc-runner:"
+            echo -e "     ${CYAN}pkg install -y glibc-repo && pkg install -y glibc-runner${NC}"
+            echo ""
             exit 1
         fi
     else
