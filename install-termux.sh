@@ -59,23 +59,35 @@ info "Ensuring CA certificates are installed..."
 if command -v pkg &>/dev/null; then
     pkg install -y ca-certificates 2>/dev/null || true
 fi
-# Auto-detect cert file location
-CERT_PATH=""
+# Auto-detect cert bundle.
+# NOTE: SSL_CERT_FILE (Go crypto/x509) MUST point to a PEM *file*, never a directory.
+#       CURL_CA_BUNDLE (curl) accepts either a PEM file or a hashed-certs directory.
+CERT_FILE=""   # PEM file for SSL_CERT_FILE
+CERT_DIR=""    # optional cacerts directory, used ONLY for CURL_CA_BUNDLE fallback
 for p in \
     "$PREFIX/etc/tls/cert.pem" \
     "$PREFIX/etc/ssl/cert.pem" \
-    "/system/etc/security/cacerts" \
     "$PREFIX/etc/ca-certificates.crt"; do
-    if [ -f "$p" ] || [ -d "$p" ]; then
-        CERT_PATH="$p"
+    if [ -f "$p" ]; then
+        CERT_FILE="$p"
         break
     fi
 done
-if [ -z "$CERT_PATH" ]; then
-    warn "No CA certificate bundle found. Attempting fallback path: $PREFIX/etc/tls/cert.pem"
-    CERT_PATH="$PREFIX/etc/tls/cert.pem"
+if [ -z "$CERT_FILE" ] && [ -d "/system/etc/security/cacerts" ]; then
+    CERT_DIR="/system/etc/security/cacerts"
 fi
-success "CA certificates resolved: $CERT_PATH"
+if [ -z "$CERT_FILE" ]; then
+    warn "No CA certificate PEM bundle found. Falling back to: $PREFIX/etc/tls/cert.pem"
+    CERT_FILE="$PREFIX/etc/tls/cert.pem"
+fi
+# curl prefers the PEM file, else falls back to the system cacerts directory
+if [ -n "$CERT_DIR" ]; then
+    CERT_PATH="$CERT_DIR"
+else
+    CERT_PATH="$CERT_FILE"
+fi
+success "CA certificate file (SSL_CERT_FILE): $CERT_FILE"
+success "CA bundle path (CURL_CA_BUNDLE): $CERT_PATH"
 
 # 4. Install & Verify glibc-runner (grun)
 if ! command -v grun &>/dev/null; then
@@ -161,15 +173,32 @@ if [ -z "$manifest_json" ]; then
     exit 1
 fi
 
+# Extract a top-level string value from the manifest.
+# Prefer jq (correct JSON parsing). Otherwise fall back to a FIRST-match
+# grep/sed extraction: unlike a greedy 'sed s/.*"key".*/\1/' (which picks the
+# LAST duplicate/nested occurrence), grep -o lists matches in order.
 parse_json_key() {
     local payload="$1"
     local key="$2"
-    echo "$payload" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+    local out=""
+
+    if command -v jq >/dev/null 2>&1; then
+        out=$(printf '%s' "$payload" | jq -r --arg k "$key" 'if type == "object" then (.[$k] // empty) else empty end' 2>/dev/null || true)
+    fi
+    if [ -z "$out" ]; then
+        out=$(printf '%s' "$payload" \
+            | grep -o "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+            | head -n 1 \
+            | sed 's/^"[^"]*"[[:space:]]*:[[:space:]]*"\(.*\)"$/\1/' || true)
+    fi
+    printf '%s' "$out"
 }
 
 version=$(parse_json_key "$manifest_json" "version")
 url=$(parse_json_key "$manifest_json" "url")
 sha512=$(parse_json_key "$manifest_json" "sha512")
+# Normalize hex case so the comparison against lowercase sha512sum output is case-insensitive
+sha512=$(printf '%s' "$sha512" | tr 'A-Z' 'a-z')
 
 if [ -z "$url" ] || [ -z "$sha512" ]; then
     error "Failed to parse release manifest. The manifest may be corrupted or malformed."
@@ -194,7 +223,7 @@ else
 fi
 
 info "Verifying package integrity..."
-actual_hash=$(sha512sum "$staging_payload" | cut -d' ' -f1 || true)
+actual_hash=$(sha512sum "$staging_payload" | cut -d' ' -f1 | tr 'A-Z' 'a-z' || true)
 
 if [ "$actual_hash" != "$sha512" ]; then
     error "Security Halt: The downloaded payload checksum does not match the manifest."
@@ -227,19 +256,27 @@ void patch_fips(unsigned char *data, size_t size, const char *hex_hash) {
     };
     unsigned char calculated[32];
 
+    if (size < 32) {
+        fprintf(stderr, "[PATCHER ERROR] Input too small for FIPS scan (%zu bytes)\n", size);
+        return;
+    }
+
     if (strlen(hex_hash) != 64) {
         fprintf(stderr, "[PATCHER ERROR] FIPS hex hash must be exactly 64 characters\n");
         return;
     }
 
     for (size_t i = 0; i < 32; i++) {
-        unsigned int val;
-        sscanf(&hex_hash[i * 2], "%2x", &val);
+        unsigned int val = 0;
+        if (sscanf(&hex_hash[i * 2], "%2x", &val) != 1) {
+            fprintf(stderr, "[PATCHER ERROR] FIPS hash contains non-hex characters\n");
+            return;
+        }
         calculated[i] = (unsigned char)val;
     }
 
     size_t count = 0;
-    for (size_t i = 0; i <= size - 32; i++) {
+    for (size_t i = 0; i + 32 <= size; i++) {
         if (memcmp(&data[i], expected, 32) == 0) {
             memcpy(&data[i], calculated, 32);
             printf("[PATCHER FIPS] Patched expected hash at offset 0x%zx\n", i);
@@ -255,7 +292,12 @@ void patch_tcmalloc(unsigned char *data, size_t size) {
     size_t movz_n = 0, movz_c = 0, movz_s = 0;
     size_t movk_n = 0, movk_c = 0, movk_s = 0;
 
-    for (size_t offset = 0; offset <= size - 4; offset += 4) {
+    if (size < 4) {
+        fprintf(stderr, "[PATCHER ERROR] Input too small for TCMalloc scan (%zu bytes)\n", size);
+        return;
+    }
+
+    for (size_t offset = 0; offset + 4 <= size; offset += 4) {
         unsigned int *ptr = (unsigned int *)&data[offset];
         unsigned int val = *ptr;
 
@@ -371,11 +413,24 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        perror("fseek");
+        fclose(f);
+        return 1;
+    }
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (size <= 0) {
+        fprintf(stderr, "[PATCHER ERROR] Invalid input size: %ld\n", size);
+        fclose(f);
+        return 1;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        perror("fseek");
+        fclose(f);
+        return 1;
+    }
 
-    unsigned char *data = malloc(size);
+    unsigned char *data = malloc((size_t)size);
     if (!data) {
         perror("malloc");
         fclose(f);
@@ -461,6 +516,10 @@ cat << 'EOF' > "$INSTALL_DIR/agy_ptrace_tracer.c"
 #define NT_ARM_SYSTEM_CALL 0x404
 #endif
 
+#ifndef PTRACE_O_EXITKILL
+#define PTRACE_O_EXITKILL 0x00100000
+#endif
+
 struct custom_pt_regs {
     unsigned long long regs[31]; // x0 to x30
     unsigned long long sp;
@@ -475,16 +534,28 @@ struct ThreadState {
     int in_syscall;
 } threads[MAX_THREADS];
 
-int get_thread_index(pid_t pid, int is_clone) {
+int find_thread_index(pid_t pid) {
     for (int i = 0; i < MAX_THREADS; i++) {
         if (threads[i].pid == pid) {
             return i;
         }
     }
+    return -1;
+}
+
+int get_thread_index(pid_t pid) {
+    int idx = find_thread_index(pid);
+    if (idx != -1) {
+        return idx;
+    }
     for (int i = 0; i < MAX_THREADS; i++) {
         if (threads[i].pid == 0) {
             threads[i].pid = pid;
-            threads[i].in_syscall = is_clone ? 1 : 0;
+            // Phase 0: a freshly seen thread's next syscall stop is an ENTRY
+            // stop, so the toggle in the SIGTRAP|0x80 handler turns this into
+            // in_syscall == 1 (entry) correctly. Seeding it with 1 would
+            // invert entry/exit for the whole lifetime of that thread.
+            threads[i].in_syscall = 0;
             return i;
         }
     }
@@ -519,7 +590,7 @@ int main(int argc, char *argv[]) {
             exit(1);
         }
         raise(SIGSTOP);
-
+        
         execvp(argv[1], &argv[1]);
         perror("execvp");
         exit(1);
@@ -531,9 +602,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE |
-                   PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
-                   PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT;
+    long options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | 
+                   PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | 
+                   PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT |
+                   PTRACE_O_EXITKILL;
     if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)options) < 0) {
         perror("[TRACER ERROR] ptrace SETOPTIONS failed");
     }
@@ -543,7 +615,7 @@ int main(int argc, char *argv[]) {
     }
 
     memset(threads, 0, sizeof(threads));
-    get_thread_index(child, 0);
+    get_thread_index(child);
 
     while (1) {
         pid_t pid = waitpid(-1, &status, __WALL);
@@ -573,50 +645,51 @@ int main(int argc, char *argv[]) {
         if (WIFSTOPPED(status)) {
             int sig = WSTOPSIG(status);
             int event = status >> 16;
-
+            
             // --- DEFENSE LINE 2: Catch and swallow Seccomp SIGSYS crash signals ---
             if (sig == SIGSYS) {
                 struct custom_pt_regs regs;
                 struct iovec iov_regs;
                 iov_regs.iov_base = &regs;
                 iov_regs.iov_len = sizeof(regs);
-
+                
                 if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs) == 0) {
                     regs.regs[0] = -38ULL; // Force return -ENOSYS
                     ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs);
                 }
-
+                
                 // Resume child with signal suppressed (0 instead of SIGSYS)
                 if (ptrace(PTRACE_SYSCALL, pid, NULL, (void *)0) < 0) {
                     perror("[TRACER ERROR] ptrace SYSCALL failed to suppress SIGSYS");
                 }
                 continue;
             }
-
+            
             if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
                 memset(threads, 0, sizeof(threads));
-                int idx = get_thread_index(pid, 1);
+                int idx = get_thread_index(pid);
                 if (idx != -1) {
-                    threads[idx].in_syscall = 1;
+                    // After exec, the next stop is the first syscall ENTRY of the new image.
+                    threads[idx].in_syscall = 0;
                 }
                 if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL) < 0) {
                     perror("[TRACER ERROR] ptrace SYSCALL failed after EXEC");
                 }
                 continue;
             }
-
+            
             if (sig == (SIGTRAP | 0x80)) {
-                int idx = get_thread_index(pid, 1);
+                int idx = get_thread_index(pid);
                 if (idx != -1) {
                     threads[idx].in_syscall = !threads[idx].in_syscall;
-
+                    
                     if (threads[idx].in_syscall) {
                         // --- DEFENSE LINE 1: Intercept ENTRY stop for faccessat2 ---
                         int syscall_num;
                         struct iovec iov;
                         iov.iov_base = &syscall_num;
                         iov.iov_len = sizeof(syscall_num);
-
+                        
                         if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov) == 0) {
                             if (syscall_num == 439) { // __NR_faccessat2 on ARM64
                                 syscall_num = -1;
@@ -625,7 +698,7 @@ int main(int argc, char *argv[]) {
                                     struct iovec iov_regs;
                                     iov_regs.iov_base = &regs;
                                     iov_regs.iov_len = sizeof(regs);
-
+                                    
                                     if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov_regs) == 0) {
                                         regs.regs[0] = -38ULL; // -ENOSYS
                                         regs.regs[8] = -1ULL;
@@ -643,12 +716,18 @@ int main(int argc, char *argv[]) {
                 }
                 continue;
             }
-
+            
             int deliver_sig = sig;
-            if (sig == SIGSTOP) {
-                deliver_sig = 0;
-            } else if (sig == SIGTRAP) {
-                deliver_sig = 0;
+            if (sig == SIGTRAP) {
+                // PTRACE event stops (clone/fork/vfork/exit) must NOT be delivered
+                // to the tracee. A genuine SIGTRAP (event == 0) is a real trap and
+                // must pass through, otherwise breakpoint/crash handling is masked.
+                deliver_sig = (event != 0) ? 0 : sig;
+            } else if (sig == SIGSTOP) {
+                // Swallow ONLY the synthetic creation stop of a brand-new thread
+                // (a pid we have never seen). A SIGSTOP aimed at an already-known
+                // thread is a genuine signal (e.g. job control) and is delivered.
+                deliver_sig = (find_thread_index(pid) < 0) ? 0 : sig;
             }
 
             if (ptrace(PTRACE_SYSCALL, pid, NULL, (void *)(long)deliver_sig) < 0) {
@@ -736,17 +815,18 @@ info "Configuring Termux environment dependencies..."
 # Unset LD_PRELOAD during setup to prevent glibc dynamic linker from loading Bionic libtermux-exec.so
 (
     unset LD_PRELOAD
+    init_log="$STAGING_DIR/agy_init.log"
     if [ -n "$LD_SO" ]; then
-        if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+        if "$INSTALL_DIR/agy_ptrace_tracer" "$LD_SO" --library-path "$GLIBC_LIB_DIR" "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>"$init_log"; then
             success "Shell configurations initialized."
         else
-            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+            warn "Soft-warning: Initial configuration returned non-zero status (see $init_log)."
         fi
     else
-        if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>/dev/null || true; then
+        if "$INSTALL_DIR/agy_ptrace_tracer" grun "$INSTALL_DIR/antigravity" install --dir "$PREFIX/bin" 2>"$init_log"; then
             success "Shell configurations initialized."
         else
-            warn "Soft-warning: Initial configuration setup threw non-fatal warnings."
+            warn "Soft-warning: Initial configuration returned non-zero status (see $init_log)."
         fi
     fi
 )
@@ -756,14 +836,14 @@ info "Creating dynamic launch wrapper at $WRAPPER_PATH..."
 if [ -z "$LD_SO" ]; then
     warn "Could not dynamically locate glibc dynamic linker. Falling back to 'grun'..."
     cat << EOF > "$WRAPPER_PATH"
-#!/data/data/com.termux/files/usr/bin/bash
+#!$PREFIX/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
 # using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
-export SSL_CERT_FILE=$CERT_PATH
-export CURL_CA_BUNDLE=$CERT_PATH
+export SSL_CERT_FILE="$CERT_FILE"
+export CURL_CA_BUNDLE="$CERT_PATH"
 
 # Proxy fallback: if proxy env vars are not set but a local proxy is detected, auto-configure
 if [ -z "\${HTTP_PROXY:-}" ] && [ -z "\${HTTPS_PROXY:-}" ]; then
@@ -788,14 +868,14 @@ EOF
 else
     success "Located glibc dynamic linker at $LD_SO"
     cat << EOF > "$WRAPPER_PATH"
-#!/data/data/com.termux/files/usr/bin/bash
+#!$PREFIX/bin/bash
 #
 # Termux dynamic glibc-runner bridge wrapper for Antigravity CLI
 # using native ptrace-based syscall interception for faccessat2 bypass.
 #
 unset LD_PRELOAD
-export SSL_CERT_FILE=$CERT_PATH
-export CURL_CA_BUNDLE=$CERT_PATH
+export SSL_CERT_FILE="$CERT_FILE"
+export CURL_CA_BUNDLE="$CERT_PATH"
 
 # Proxy fallback: if proxy env vars are not set but a local proxy is detected, auto-configure
 if [ -z "\${HTTP_PROXY:-}" ] && [ -z "\${HTTPS_PROXY:-}" ]; then
@@ -820,9 +900,8 @@ EOF
 fi
 
 chmod +x "$WRAPPER_PATH"
-if [ -n "$LD_SO" ] && [ -f "$LD_SO" ]; then
-    chmod 555 "$LD_SO" || true
-fi
+# NOTE: intentionally NOT chmod-ing the glibc dynamic linker read-only.
+# Doing so previously got in the way of future `pkg upgrade glibc-runner`.
 success "Wrapper created and executable bits set."
 
 echo ""
