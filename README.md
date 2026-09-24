@@ -76,14 +76,14 @@ glibc-runner 解释器 [grun] 或 直接调用 glibc 动态链接器 [ld-linux-a
 在您的 **Termux** 终端中拷贝并运行以下一键安装命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash
+curl -fsSL https://raw.githubusercontent.com/furina707/agy-cli-termux/main/install-termux.sh | bash
 ```
 
 或者，您也可以先克隆本仓库到本地，然后运行安装脚本：
 
 ```bash
-git clone https://github.com/furina707/agy-termux.git
-cd agy-termux
+git clone https://github.com/furina707/agy-cli-termux.git
+cd agy-cli-termux
 bash install-termux.sh
 ```
 
@@ -143,7 +143,7 @@ agy
 请使用以下命令进行安全升级：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash
+curl -fsSL https://raw.githubusercontent.com/furina707/agy-cli-termux/main/install-termux.sh | bash
 ```
 
 ---
