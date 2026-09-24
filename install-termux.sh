@@ -779,7 +779,7 @@ fi
 if [ "\$1" = "update" ]; then
     echo -e "\033[33mℹ Termux 兼容层提示：由于 Termux 下的 agy 包含 35-bit 降维与 FIPS 完整性签名补丁，直接使用官方二进制升级会导致程序失效。\033[0m"
     echo -e "\033[36m👉 如需安全升级，请运行以下一键安全升级命令：\033[0m"
-    echo -e "   curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash"
+    echo -e "   curl -fsSL https://raw.githubusercontent.com/furina707/agy-cli-termux/main/install-termux.sh | bash"
     exit 0
 fi
 
@@ -811,7 +811,7 @@ fi
 if [ "\$1" = "update" ]; then
     echo -e "\033[33mℹ Termux 兼容层提示：由于 Termux 下的 agy 包含 35-bit 降维与 FIPS 完整性签名补丁，直接使用官方二进制升级会导致程序失效。\033[0m"
     echo -e "\033[36m👉 如需安全升级，请运行以下一键安全升级命令：\033[0m"
-    echo -e "   curl -fsSL https://raw.githubusercontent.com/furina707/agy-termux/main/install-termux.sh | bash"
+    echo -e "   curl -fsSL https://raw.githubusercontent.com/furina707/agy-cli-termux/main/install-termux.sh | bash"
     exit 0
 fi
 
