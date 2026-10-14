@@ -89,6 +89,79 @@ fi
 success "CA certificate file (SSL_CERT_FILE): $CERT_FILE"
 success "CA bundle path (CURL_CA_BUNDLE): $CERT_PATH"
 
+# 3.6. Configure DNS resolution for glibc runtime environment
+# Termux's /etc/resolv.conf is usually populated by Android's netd and often
+# contains IPv6 loopback (::1) or 127.0.0.1 entries. Android's local DNS
+# resolver typically listens only on IPv4, so glibc / Go binaries running under
+# glibc-runner will fail when they try the IPv6 ::1:53 nameserver first.
+# We configure a clean, IPv4-only resolv.conf for the glibc environment.
+info "Configuring DNS resolution for glibc runtime environment..."
+DNS_NAMESERVERS=""
+DNS_OTHER_OPTIONS=""
+
+# Extract nameservers and other useful entries (search, domain, options) from system resolv.conf
+if [ -f "/etc/resolv.conf" ]; then
+    # IPv4-only nameservers, skip IPv6 loopback (::1) and local 127.0.0.1 entries
+    DNS_NAMESERVERS=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf | \
+        grep -v '::' || true)
+    # Preserve search/domain/options lines (if any) to keep local domain resolution working
+    DNS_OTHER_OPTIONS=$(grep -E '^(search|domain|options)' /etc/resolv.conf || true)
+fi
+
+# Verify reachability of each candidate nameserver, keep only working ones
+if [ -n "$DNS_NAMESERVERS" ]; then
+    WORKING_DNS=""
+    for ns in $DNS_NAMESERVERS; do
+        if timeout 1 bash -c "echo -n '' | nc -u -w1 '$ns' 53" 2>/dev/null; then
+            WORKING_DNS="${WORKING_DNS}${WORKING_DNS:+
+}${ns}"
+        fi
+    done
+    DNS_NAMESERVERS="$WORKING_DNS"
+fi
+
+# Fallback: public DNS servers if no usable system DNS was found
+if [ -z "$DNS_NAMESERVERS" ]; then
+    info "System resolv.conf has no working IPv4 nameservers, falling back to public DNS..."
+    DNS_NAMESERVERS="8.8.8.8
+8.8.4.4
+1.1.1.1"
+fi
+
+# Build the clean resolv.conf content with working nameservers + preserved options
+RESOLV_CONTENT=""
+for ns in $(echo "$DNS_NAMESERVERS" | head -3); do
+    RESOLV_CONTENT="${RESOLV_CONTENT}nameserver $ns"$'\n'
+done
+if [ -n "$DNS_OTHER_OPTIONS" ]; then
+    # Preserve existing search/domain entries; skip any options line that might break things
+    while IFS= read -r line; do
+        if echo "$line" | grep -q '^search\|^domain'; then
+            RESOLV_CONTENT="${RESOLV_CONTENT}${line}"$'\n'
+        fi
+    done <<< "$DNS_OTHER_OPTIONS"
+fi
+RESOLV_CONTENT="${RESOLV_CONTENT}options edns0"$'\n'
+
+# Write to /etc/resolv.conf (primary, for Go pure DNS resolver and glibc resolver)
+if [ -w "/etc/resolv.conf" ]; then
+    # Backup original just in case
+    cp -f /etc/resolv.conf /etc/resolv.conf.bak-agy 2>/dev/null || true
+    echo "$RESOLV_CONTENT" > /etc/resolv.conf
+    success "Updated /etc/resolv.conf with IPv4-only nameservers"
+elif [ -f "/etc/resolv.conf" ]; then
+    warn "Cannot write to /etc/resolv.conf (read-only). DNS fix may be incomplete."
+fi
+
+# Also mirror the working DNS list into Termux's own resolv.conf location
+# (some Termux glibc-runner builds read $PREFIX/etc/resolv.conf)
+TERMUX_RESOLV_DIR="$PREFIX/etc"
+mkdir -p "$TERMUX_RESOLV_DIR" 2>/dev/null || true
+echo "$RESOLV_CONTENT" > "$TERMUX_RESOLV_DIR/resolv.conf" 2>/dev/null || true
+
+success "DNS nameservers configured:"
+head -3 "$TERMUX_RESOLV_DIR/resolv.conf" 2>/dev/null | sed 's/^/  /'
+
 # 4. Install & Verify glibc-runner (grun)
 if ! command -v grun &>/dev/null; then
     info "glibc-runner (grun) not found. Attempting automatic installation..."
@@ -773,6 +846,22 @@ else
     GLIBC_LIB_DIR="$GLIBC_PREFIX/lib"
 fi
 
+# 9.1. Mirror working DNS servers into the glibc prefix resolv.conf
+# Some glibc-runner setups maintain a dedicated etc directory inside the
+# glibc prefix; writing the same clean resolv.conf there ensures glibc's
+# own resolver picks up the working IPv4-only nameservers.
+GLIBC_RESOLV_DIR="$GLIBC_PREFIX/etc"
+mkdir -p "$GLIBC_RESOLV_DIR" 2>/dev/null || true
+if [ -n "$DNS_NAMESERVERS" ]; then
+    {
+        for ns in $(echo "$DNS_NAMESERVERS" | head -3); do
+            echo "nameserver $ns"
+        done
+        echo "options edns0"
+    } > "$GLIBC_RESOLV_DIR/resolv.conf" 2>/dev/null || true
+    success "glibc prefix resolv.conf written at $GLIBC_RESOLV_DIR/resolv.conf"
+fi
+
 # 9.5. Phase 2: Dynamic BoringSSL FIPS expected hash capturing and patching
 info "Entering Phase 2: Resolving BoringSSL FIPS calculated hash dynamically..."
 (
@@ -845,6 +934,9 @@ unset LD_PRELOAD
 export SSL_CERT_FILE="$CERT_FILE"
 export CURL_CA_BUNDLE="$CERT_PATH"
 
+# DNS resolution: glibc resolver prefers IPv4 to avoid Android's missing ::1 nameserver
+export RES_OPTIONS="\${RES_OPTIONS:-nssort:inet4only}"
+
 # Proxy fallback: if proxy env vars are not set but a local proxy is detected, auto-configure
 if [ -z "\${HTTP_PROXY:-}" ] && [ -z "\${HTTPS_PROXY:-}" ]; then
     if command -v curl &>/dev/null; then
@@ -876,6 +968,9 @@ else
 unset LD_PRELOAD
 export SSL_CERT_FILE="$CERT_FILE"
 export CURL_CA_BUNDLE="$CERT_PATH"
+
+# DNS resolution: glibc resolver prefers IPv4 to avoid Android's missing ::1 nameserver
+export RES_OPTIONS="\${RES_OPTIONS:-nssort:inet4only}"
 
 # Proxy fallback: if proxy env vars are not set but a local proxy is detected, auto-configure
 if [ -z "\${HTTP_PROXY:-}" ] && [ -z "\${HTTPS_PROXY:-}" ]; then
