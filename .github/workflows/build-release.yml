@@ -1,0 +1,75 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag'
+        required: true
+        default: '7-1.1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Cross-compile for aarch64 (glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install aarch64 cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build agy_patcher
+        run: |
+          aarch64-linux-gnu-gcc -O3 -Wall -o build/agy_patcher.aarch64 agy_patcher.c
+          file build/agy_patcher.aarch64
+
+      - name: Build agy_ptrace_tracer
+        run: |
+          aarch64-linux-gnu-gcc -O3 -Wall -o build/agy_ptrace_tracer.aarch64 agy_ptrace_tracer.c
+          file build/agy_ptrace_tracer.aarch64
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cd build
+          tar -czf ../dist/agy-cli-termux-${{ steps.version.outputs.tag }}-arm64.tar.gz agy_patcher.aarch64 agy_ptrace_tracer.aarch64
+          cd ..
+          sha512sum dist/*.tar.gz > dist/SHA512SUMS
+          echo "--- artifacts ---"
+          ls -lh dist/
+          echo "--- SHA512SUMS ---"
+          cat dist/SHA512SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agy-cli-termux-${{ steps.version.outputs.tag }}-arm64
+          path: dist/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: agy-cli-termux ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA512SUMS
